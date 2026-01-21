@@ -1,0 +1,305 @@
+== wdriver, a wets-s test client [[wdriver]]
+
+This application was written to test the protocol between a `wets-s`
+service, the `nats-server`.
+The `wdriver` client performs sufficient response to messsages to drive the
+executable model through a complete transit cycle. Essentially, it does
+in script what the original mechanical and vessel state models did.
+
+The core of `wdriver` is simple message wait, receive, and respond, so
+only a few packages are needed. `wdriver` does not use `rosea` or `ral`
+packages.
+
+(((wdriver,chunks,packages)))
+[source,tcl]
+----
+<<wd-required-packages>>=
+package require json
+package require nats
+----
+
+This is an informal application but we still put procedures in namespaces.
+Like `wets-s` a connection is needed for communicating with the `nats-server`;
+this will be the first declaration in the namespace (`wets++_++driver`).
+
+[source,tcl]
+----
+<<wd-variables>>=
+variable conn -1
+----
+
+Requesting a connection will connect to the `nats-server` in a similar
+manner to <<wets-s.adoc#wets-s,wets-s>>.
+
+(((wdriver,chunks,getConn)))
+
+.`getConn` [[wdriver-get-conn]]
+
+[source,tcl]
+----
+<<wd-procs>>=
+proc getConn {} {
+    variable conn
+    if {$conn == -1} {
+        set conn [nats::connection new "Wets"]
+        $conn configure -servers nats://localhost:4222
+        $conn connect
+        puts "Connection status: [$conn cget -status]"
+        puts "NATS version: [dict get [$conn server_info] version]"
+    }
+    return $conn
+}
+----
+
+=== Incoming messages
+
+To address messages arriving on the `wets.client` NATS channel, we subscribe to
+that channel with a local un-exposed callback in which the individual messages
+can be handled separately.
+
+(((wdriver,chunks,listen)))
+
+.`listen` [[wddriver-listen]]
+
+[source,tcl]
+----
+<<wd-procs>>=
+proc listen {} {
+    # subscribe to wets messages here
+    set connection [getConn]
+    $connection subscribe Wets.client -callback ::wets_driver::onWetsMessage
+
+}
+----
+
+In a _real_ WETS simulator, a message would perform some meaningful work
+and then the appropriate response would be given. Our message handling
+here is simplified to,
+
+[arabic]
+. Print a message
+. Wait momentarily
+. Assemble and publish the appropriate response.
+
+(((wdriver,chunks,onWetsMessage)))
+
+.`onWetsMessage` [[wdriver-on-wets-message]]
+
+This message is shown here as a code template of a switch whose cases are
+described individually in the following sections,
+
+<<wdriver-motor-message,Motor>>:: Motor run-in and run-out
+<<wdriver-vessel-message,Vessel>>:: Vessel moves
+<<wdriver-flow-sensor-message,FlowSensor>>:: Flow sensor monitoring
+
+[source,tcl]
+----
+<<wd-procs>>=
+# namespace export onWetsMessage
+proc onWetsMessage {subject message replyTo} {
+    set cmd_dict [::json::json2dict $message]
+    switch [dict get $cmd_dict object] {
+        <<wdriver-message-handling>>
+        default {
+            puts "Unknown object: [dict get $cmd_dict object]"
+        }
+
+    }
+}
+----
+
+==== Motor [[wdriver-motor-message]]
+
+All motor messages are either `RUN_IN` or `RUN_OUT` commands. In
+either case, the only valid response is to send
+<<wdriver-motor-completed,motor completed>>.
+
+(((wdriver,incoming,Motor)))
+
+[source,tcl]
+----
+<<wdriver-message-handling>>=
+Motor {
+    puts [format " <-- %s on %s" \
+              [dict get $cmd_dict operation] \
+              [dict get $cmd_dict name]
+         ]
+    after 1000 set state timeout
+    vwait state
+    motor_completed [dict get $cmd_dict name]
+}
+----
+
+==== Vessel [[wdriver-vessel-message]]
+
+(((wdriver,incoming,Vessel)))
+
+The `Vessel` `MOVE` command is delivered when the vessel is waiting in front
+of a gate, ready to transit to the next chamber. All we need to do is wait a
+short period of time to account for the move then respond with a
+<<wdriver-vessel-passed-gate,vessel passed gate>> message.
+
+[source,tcl]
+----
+<<wdriver-message-handling>>=
+Vessel {
+    puts [format " <-- %s %s through %s" \
+              [dict get $cmd_dict operation] \
+              [dict get $cmd_dict license] \
+              [dict get $cmd_dict gate]
+         ]
+    after 1000 set state timeout
+    vwait state
+    vessel_passed_gate [dict get $cmd_dict license]
+}
+----
+
+==== FlowSensor [[wdriver-flow-sensor-message]]
+
+(((wdriver,incoming,FlowSensor)))
+
+There is a single flow sensor message, MONITOR_FLOW, to which the only valid
+response is <<wdriver.adoc#wdriver-flow-equalized,flow equalized>>.
+
+[source,tcl]
+----
+<<wdriver-message-handling>>=
+FlowSensor {
+    puts [format " <-- %s on FlowSensor %s" \
+             [dict get $cmd_dict operation] \
+             [dict get $cmd_dict name] \
+             ]
+    after 1000 set state timeout
+    vwait state
+    flow_equalized [dict get $cmd_dict name]
+}
+----
+
+
+=== Outgoing messages
+
+All messages are `JSON` and it is convenient in `Tcl` to build a
+dictionary of the message parts and pass that into a common procedure.
+
+(((wdriver,chunks,nats_publish)))
+[source,tcl]
+----
+<<wd-procs>>=
+proc nats_publish {msg_dict} {
+    set msg [nats::msg create wets_message]
+    nats::msg set msg -subject "Wets.1"
+    nats::msg set msg -data [json::dict2json $msg_dict]
+    set connection [getConn]
+    $connection publish_msg $msg
+}
+----
+
+==== Motor Completed [[wdriver-motor-completed]]
+
+When a motor has completed its move the client responds with a
+*MotorCompleted* message with a _name_ as the only indicator. This is because
+this test application (and the eventual real simulator) will not store state,
+just perform a named action for an named entity. We just have to say we
+finished that action and let the model on the other side of the `nats-server`
+take care of determining what needs to be done next.
+
+(((wdriver,chunks,motor_completed)))
+[source,tcl]
+----
+<<wd-procs>>=
+namespace export motor_completed
+proc motor_completed { name } {
+    dict set mmsg object {"MotorCompleted"}
+    dict set mmsg name [json::write::string $name]
+    puts " --> Motor completed for $name"
+    nats_publish $mmsg
+}
+----
+
+==== Vessel passed gate [[wdriver-vessel-passed-gate]]
+
+(((wdriver,chunks,vessel_passed_gate)))
+[source,tcl]
+----
+<<wd-procs>>=
+namespace export vessel_passed_gate
+proc vessel_passed_gate {license} {
+    dict set vmsg object {"VesselPassedGate"}
+    dict set vmsg license [json::write::string $license]
+    puts " --> Vessel \"$license\" passed gate"
+    nats_publish $vmsg
+}
+----
+
+==== Vessel started [[wdriver-vessel-started]]
+
+To keep the test short, the smallest of the populations is used, `Wets_1`
+which has 2 gates, 2 valves, and 2 flow sensors.
+
+(((wdriver,chunks,vessel_started)))
+[source,tcl]
+----
+<<wd-procs>>=
+namespace export vessel_started
+proc vessel_started {v_license v_direction} {
+    dict set vmsg object {"VesselArrived"}
+    dict set vmsg license [json::write::string $v_license]
+    dict set vmsg wets_name {"Wets_1"}
+    dict set vmsg direction [json::write::string $v_direction]
+    puts " --> Starting vessel \"$v_license\""
+    nats_publish $vmsg
+}
+----
+
+==== Flow equalized [[wdriver-flow-equalized]]
+
+(((wdriver,chunks,flow_equalized)))
+[source,tcl]
+----
+<<wd-procs>>=
+namespace export flow_equalized
+proc flow_equalized { name } {
+    dict set fmsg object {"FlowEqualized"}
+    dict set fmsg name [json::write::string $name]
+    puts " --> Flow equalized for \"$name\""
+    nats_publish $fmsg
+}
+----
+
+For the main routine, a listen call is made which will start the connection to
+the `nats-server`, after which the vessel named the *Hail Mary* is started in
+the downstream direction.
+
+And then we wait.
+
+(((wdriver,chunks,main)))
+[source,tcl]
+----
+<<wd-main>>=
+::wets_driver::listen
+::wets_driver::vessel_started "Hail Mary" "down"
+
+vwait forever
+----
+
+=== Code layout
+
+The ommission of logging has been done to keep the script short and simple.
+
+(((wdriver,chunks,wdriver.tcl)))
+[source,tcl]
+----
+<<wdriver.tcl>>=
+#!/usr/bin/env tclsh
+
+package require Tcl 8.6 9
+<<wd-required-packages>>
+
+namespace eval ::wets_driver {
+    <<wd-logging-setup>>
+    <<wd-variables>>
+    <<wd-procs>>
+}
+
+<<wd-main>>
+----

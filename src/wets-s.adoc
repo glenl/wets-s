@@ -1,0 +1,686 @@
+== wets-s [[wets-s]]
+
+The application described in this document, `wets-s`, is a service agent that
+uses JSON messaging to control a translated WETS information model.
+This is a `Tcl` application, so the
+https://repos.modelrealization.com/cgi-bin/fossil/mrtools/wiki?name=RoseaPage[rosea]
+tool has been used to create an
+executable model we will source for our implementation.
+
+The source code portion of this literate document starts with the inclusion of
+these packages into our application.
+
+(((wets-s,chunks,packages)))
+[source,tcl]
+----
+<<wets-s-required-packages>>=
+package require json
+package require nats
+package require rosea
+----
+
+////
+The WETS model execution is started by introducing a vessel element in
+an up- or down- stream direction. Once started, WETS will guide the vessel
+through the lock.
+
+Included as part of the WETS model is a set of adjunct entities representing
+the state of the external entities itemized above. These are primarily used
+during testing so that various scenarios can be sequenced through the system.
+////
+
+The domains that need to be sourced from the translation are described in
+the <<wets-model-domains,WETS model domains>> table.
+
+.WETS model domains [[wets-model-domains]]
+
+[cols="1,2",options="header"]
+|===
+| Domain               | Description
+
+| wets                 | The core model of control
+
+| wets bridge          | Defines the bridging for external interaction
+
+| mechanical managment
+| Entities like valves and gates that are controlled by
+  mechanical means.
+
+| vessel management    | For vessels arriving for transit through the system
+|===
+
+Note below that the original rosea translations are sourced but the
+mechanical and vessel management have been modified to use our
+communication strategy instead of calling directly into the bridge.
+
+[source,tcl]
+----
+<<wets-rosea>>=
+set top [file normalize [file join [file dirname $argv0] ".."]]
+source [file join $top "rosea_translation" "wets.tcl"]
+source [file join $top "rosea_translation" "wets_bridge.tcl"]
+source [file join $top "translation" "mechanical_mgmt.tcl"]
+source [file join $top "translation" "vessel_mgmt.tcl"]
+----
+
+The WETS entities on which we will focus are shown in the
+<<wets-entities,WETS entities>> table.
+
+.WETS entities [[wets-entities]]
+
+[cols="1,3",options=header]
+|===
+|Entity | Description
+
+| Gate
+
+.2+|Motor controlled devices.
+
+| Valve
+
+| Flow sensor | Provides information for manipulation of motors.
+
+| Vessel | A client vessel, transiting between upstream and downstream.
+
+|===
+
+The `rosea` system dictates that we must configure the domains, generate the
+`Tcl` code, and populate the necessary domains. Flow sensors are considered
+part of the mechanical management domain, but note that vessels are created as
+they arrive for transit.
+
+[source,tcl]
+----
+<<wets-rosea>>=
+rosea configure {
+    domain wets $::wets
+    domain mechanical_mgmt $::mechanical_mgmt
+    domain vessel_mgmt $::vessel_mgmt
+}
+rosea generate
+rosea populate {
+    domain wets $::wets_pop
+    domain mechanical_mgmt $::mechanical_mgmt_pop
+}
+----
+
+To allow tracing of model execution, we pass the appropriate commands to
+`rosea`. It is recommended that the level be carefully chosen for the amount
+of debugging that you are doing as `debug` can be voluminous.
+
+[source,tcl]
+----
+<<wets-rosea>>=
+if {$::options(trace)} {
+    rosea trace control loglevel {$::options(level)}
+    rosea trace control logon
+    rosea trace control on
+}
+----
+
+All that is needed now is to listen to our NATS server for incoming
+messages and wait.
+
+[source,tcl]
+----
+<<wets-s-main>>=
+::nats_xfer::listen
+
+vwait forever
+----
+
+=== NATS interaction
+
+This application uses NATS Core and a single connection, which is
+defined as a namespace global.
+
+[source,tcl]
+----
+<<wets-s-variables>>=
+variable connection -1
+----
+
+.`get_conn`
+Access to the connection is wrapped in a routine forming a singleton
+pattern. This un-exported proc serves as a reasonable protection for the
+connection.
+
+Called whenever the connection is needed, this creates and configures the
+connection before performing the connect.
+[source,tcl]
+----
+<<nats-xfer>>=
+proc get_conn {} {
+    variable connection
+    if {$connection == -1} {
+        set connection [nats::connection new "Wets"]
+        $connection configure -servers nats://localhost:4222
+        $connection connect
+        log::notice "Connection status: [$connection cget -status]"
+        log::notice "NATS version: [dict get [$connection server_info] version]"
+    }
+    return $connection
+}
+----
+
+=== Wets.1 subscription [[wets-1-sub]]
+
+We will be publishing as well as listening to the NATS server. When an
+external entity publishes a message on the `Wets.1` channel it is handled by
+a routine called `onWetsMessage` in this namespace.
+
+(((Wets.1,listen)))
+
+.`listen`
+This procedure gets the connection, possibly initializing it
+
+[source,tcl]
+----
+<<nats-xfer>>=
+namespace export listen
+proc listen {} {
+    set conn [get_conn]
+    # Listen for Wets.1 messages
+    $conn subscribe Wets.1 -callback ::nats_xfer::onWetsMessage
+}
+----
+
+Each arriving `Wets.1` message is a JSON string, out of which a single
+common `object` component is retrieved, which is then used as a case element
+of a switch statement. It is convenient to convert the JSON to a `Tcl` dict
+for use in each case statement.
+
+(((Wets.1,onWetsMessage)))
+
+.`onWetsMessage`
+[source,tcl]
+----
+<<nats-xfer>>=
+proc onWetsMessage {subject message replyTo} {
+    set cmd_dict [::json::json2dict $message]
+    switch [dict get $cmd_dict object] {
+        <<wets-msgs>>
+        default {
+            log::warn "Unknown object: [dict get $cmd_dict object]"
+        }
+    }
+}
+----
+
+Arriving messages each have their own expected JSON content.
+
+In this message handling routine the wormhole calls are not made
+directly but deferred to state machine activity in the mechanical and
+vessel management objects.
+
+(((Wets.1,VesselArrived)))
+
+.*VesselArrived* [[vessel-arrived]]
+
+The `VesselArrived` message introduces a vessel into the WETS system.
+
+[cols="1,2",options="header"]
+|===
+| Key       | Value
+
+| object
+| Must be *VesselArrived*
+
+| license
+| The vessel's registration / name.
+
+| wets_name
+| The name of the population the client is using.
+
+| direction
+| "up" for upstream, "down" for downstream.
+
+|===
+
+This incoming message results in a asynchronous `Start_transfer` message sent
+to the `Vessel` domain.
+
+[source,tcl]
+----
+<<wets-msgs>>=
+VesselArrived {
+    log::info [format "Vessel %s arrived, going %s" \
+                  [dict get $cmd_dict license] \
+                  [dict get $cmd_dict direction]]
+    ::vessel_mgmt asyncCreationReceiver Vessel \
+        [list License [dict get $cmd_dict license]] \
+        Start_transfer \
+        [dict get $cmd_dict wets_name] \
+        [dict get $cmd_dict direction]
+}
+----
+
+(((Wets.1,VesselPassedGate)))
+
+.*VesselPassedGate* [[vessel-passed-gate]]
+
+[cols="1,2",options="header"]
+|===
+| Key       | Value
+
+| object
+| Must be *VesselPassedGate*
+
+| license
+| The vessel's registration / name.
+
+|===
+
+This indicates that a vessel has passed through an open
+gate.
+
+[source,tcl]
+----
+<<wets-msgs>>=
+VesselPassedGate {
+    log::info [format "Vessel %s passed gate" \
+                   [dict get $cmd_dict license]]
+    ::vessel_mgmt asyncControlReceiver Vessel \
+        [list License [dict get $cmd_dict license]] \
+        Passed_gate
+}
+----
+
+(((Wets.1,MotorCompleted)))
+
+.*MotorCompleted* [[motor-completed]]
+
+These messages occur when either a valve or gate have completed their required
+motion.
+
+[cols="1,2",options="header"]
+|===
+| Key       | Value
+
+| object
+| Must be *MotorCompleted*
+
+| name
+| The internal identifier, defined in the `rosea` population, for the valve
+  or gate.
+
+|===
+
+Whether opening or closing, these
+always result in an `extent++_++reached` message to the specific named
+entity.
+
+[source,tcl]
+----
+<<wets-msgs>>=
+MotorCompleted {
+    log::info [format "Motor for %s completed" \
+                   [dict get $cmd_dict name]]
+    ::mechanical_mgmt asyncControlReceiver Motor \
+        [list name [dict get $cmd_dict name]] \
+        extent_reached
+}
+----
+
+(((Wets.1,FlowEqualized)))
+
+.*FlowEqualized* [[flow-equalized]]
+
+These message are expected when an open valve results in an equal water level
+on either side of a gate.
+
+[cols="1,2",options="header"]
+|===
+| Key       | Value
+
+| object
+| Must be *FlowEqualized*
+
+| name
+| The internal identifier, defined in the `rosea` population, for the flow
+  sensor.
+
+|===
+
+`FlowEqualized` messages are translated to a `flow++_++zero` message to the
+named flow sensor.
+
+[source,tcl]
+----
+<<wets-msgs>>=
+FlowEqualized {
+    log::info [format "Flow equalized on %s" \
+                   [dict get $cmd_dict name]]
+    ::mechanical_mgmt asyncControlReceiver Flow_Sensor \
+        [list name [dict get $cmd_dict name]] \
+        flow_zero
+}
+----
+
+=== Wets.client published messages
+
+There are several events that are sent to our NATS server on a channel
+named *Wets.client*. The message content is a `dict` structure that is
+translated to JSON and published as data. Note that this routine is
+strictly used internally.
+
+(((wets-s,chunks,nats-publish)))
+
+[source,tcl]
+----
+<<nats-xfer>>=
+proc nats_publish {msg_dict} {
+    set msg [nats::msg create wets_message]
+    nats::msg set msg -subject "Wets.client"
+    nats::msg set msg -data [json::dict2json $msg_dict]
+    set conn [get_conn]
+    $conn publish_msg $msg
+}
+----
+
+(((Wets.client,Motor RUN_OUT)))
+
+.`Motor RUN++_++OUT` [[motor-run-out]]
+
+The motor run out command has this JSON structure.
+
+.The RUN++_++OUT message structure
+[cols="1,2",options="header"]
+|===
+| Key | Value
+
+| object
+| Must be *Motor*
+
+| operation
+| Must be *RUN++_++OUT*
+
+| name
+| Valve or gate name from the `rosea` population.
+
+|===
+
+For example,
+
+[source,json]
+----
+{
+    { "object" : "Motor"
+    , "name" : "Valve-M02"
+    , "operation" : "RUN_OUT"
+    }
+}
+----
+
+All messages are published through our common routine so all we need to
+do in each of these routines is assemble a dictionary. This is similar to all
+of our published methods.
+
+(((wets-s,chunks,motor run_out)))
+
+[source,tcl]
+----
+<<nats-xfer>>=
+namespace export motor_runout
+proc motor_runout { motor_name } {
+    dict set motor_msg object {"Motor"}
+    dict set motor_msg operation {"RUN_OUT"}
+    dict set motor_msg name [json::write::string $motor_name]
+    log::notice [format "Sending RUN_OUT for %s" $motor_name]
+    nats_publish $motor_msg
+}
+----
+
+(((Wets.client,Motor RUN_IN)))
+
+.`Motor RUN++_++IN` [[motor-run-in]]
+
+Opens the named `valve` or `gate` entity.
+
+[cols=",",options="header"]
+|===
+| Key       | Value
+
+| object
+| Must be *Motor*
+
+| operation
+| Must be *RUN++_++IN*
+
+| name
+| Valve or gate name from the `rosea` population.
+
+|===
+
+After publishing this messages, the client is expected to respond with
+<<motor-completed,MotorCompleted>> when it has completed it activity.
+
+(((wets-s,chunks,motor_runin)))
+[source,tcl]
+----
+<<nats-xfer>>=
+namespace export motor_runin
+proc motor_runin { motor_name } {
+    dict set motor_msg object {"Motor"}
+    dict set motor_msg operation {"RUN_IN"}
+    dict set motor_msg name [json::write::string $motor_name]
+    log::notice [format "Sending RUN_IN for %s" $motor_name]
+    nats_publish $motor_msg
+}
+----
+
+(((Wets.client,Vessel MOVE)))
+
+.`Vessel MOVE`
+
+This message is called when a gate is open and ready for a vessel to pass
+through.
+
+[cols="1,2",options="header"]
+|===
+| Key       | Value
+| object
+| Must be *Vessel*
+
+| operation
+| *MOVE*
+
+| license
+| Vessel license / name
+
+| gate
+| Gate name, from the `rosea` population.
+
+|===
+
+When the activity completes, the client is expected to send a
+<<vessel-passed-gate,VesselPassedGate>> message.
+
+(((wets-s,chunks,vessel_move)))
+[source,tcl]
+----
+<<nats-xfer>>=
+namespace export vessel_move
+proc vessel_move { gate license } {
+    dict set vessel_msg object {"Vessel"}
+    dict set vessel_msg operation {"MOVE"}
+    dict set vessel_msg license [json::write::string $license]
+    dict set vessel_msg gate [json::write::string $gate]
+    log::notice [format "Sending MOVE vessel %s through %s" $license $gate]
+    nats_publish $vessel_msg
+}
+----
+
+(((Wets.client,FlowSensor MONITOR_FLOW)))
+
+.`FlowSensor MONITOR++_++FLOW` [[monitor-flow]]
+
+For the gate to open, the water flow on either side of the valve must be
+equal, indicating that the water level on either side of a gate is equal as well.
+
+[cols="1,2",options="header"]
+|===
+|Key        | Value
+| object
+| Must be *FlowSensor*
+
+| operation
+| Must be *MONITOR++_++FLOW*
+
+| name
+| Sensor name, from the `rosea` population.
+
+|===
+
+(((wets-s,chunks,monitor_flow)))
+[source,tcl]
+----
+<<nats-xfer>>=
+namespace export monitor_flow
+proc monitor_flow { name } {
+    dict set flow_sensor_msg object {"FlowSensor"}
+    dict set flow_sensor_msg operation {"MONITOR_FLOW"}
+    dict set flow_sensor_msg name [json::write::string $name]
+    log::notice [format "Sending MONITOR_FLOW for flow sensor %s" $name]
+    nats_publish $flow_sensor_msg
+}
+----
+
+
+=== Code Layout
+
+All of the WETS messaging has been completed in previous sections, the
+following are mostly details about source code construction.
+
+<<wets-s-cli,Command-line>>:: Command line options and parsing.
+<<wets-s-logging,Logging>>:: Logging set up
+
+.Command Line Options Parsing [[wets-s-cli]]
+
+The Tcl standard library package, *cmdline* is used to parse the command
+line arguments.
+
+(((wets-s,chunks,packages)))
+[source,tcl]
+----
+<<wets-s-required-packages>>=
+package require cmdline
+----
+
+A list of command options must be provided to the option parsing
+procedure.
+
+.Command options
+[cols="1,2",options="header"]
+|===
+|Command |Description
+
+|level
+|Debug level, one of notice,info,warn,debug
+
+|trace
+|Turn `rosea` tracing on
+|===
+
+
+(((wets-s,chunks,options)))
+[source,tcl]
+----
+<<wets-s-options>>=
+set optlist {
+    {level.arg notice {Logging level.}}
+    {trace {Trace state machine transitions}}
+}
+----
+
+The single command, *getoptions*, does the heavy lifting.
+
+(((wets-s,chunks,options)))
+[source,tcl]
+----
+<<wets-s-options>>=
+set usage "\[options]:"
+try {
+    array set ::options [::cmdline::getoptions argv $optlist $usage]
+} trap {CMDLINE USAGE} {msg} {
+    chan puts -nonewline stderr $msg
+    exit 1
+}
+----
+
+(((wets-s,Logging)))
+
+.Logging [[wets-s-logging]]
+
+The Tcl standard library package, *logger*, and its companions are used
+to provide logging facilities.
+
+(((wets-s,chunks,packages)))
+[source,tcl]
+----
+<<wets-s-required-packages>>=
+package require logger
+package require logger::utils
+package require logger::appender
+----
+
+The following code sequence initializes the logging in a child namespace
+called, *log*. This chunk is used for all namespaces where we want
+logging.
+
+(((wets-s,chunks,logging)))
+[source,tcl]
+----
+<<logging-setup>>=
+set logger [::logger::initNamespace [namespace current]]
+set appenderType [expr {[dict exist [fconfigure stdout] -mode] ?\
+        "colorConsole" : "console"}]
+logger::utils::applyAppender -appender $appenderType -serviceCmd $logger\
+        -appenderArgs {-conversionPattern {\[%c\] \[%p\] '%m'}}
+
+log::setlevel $::options(level)
+----
+
+The last step is to collect all the chunks into the final application.
+
+.Final Assembly [[wets-s-final-assembly]]
+
+(((wets-s,chunks,wets-s.tcl)))
+[source,tcl]
+----
+<<wets-s.tcl>>=
+#!/usr/bin/env tclsh
+
+package require Tcl 8.6 9
+package require ral
+namespace eval ::ral {
+    package require textutil
+}
+<<wets-s-required-packages>>
+
+<<wets-s-options>>
+
+<<wets-s-command-line-parsing>>
+
+namespace eval ::nats_xfer {
+    <<wets-s-variables>>
+    <<logging-setup>>
+    <<nats-xfer>>
+}
+
+namespace eval ::wets {
+    <<logging-setup>>
+}
+
+namespace eval ::mechanical_mgmt {
+    <<logging-setup>>
+}
+
+namespace eval ::vessel_mgmt {
+    <<logging-setup>>
+}
+
+<<wets-rosea>>
+
+<<wets-s-main>>
+----

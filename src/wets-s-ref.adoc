@@ -1,0 +1,16 @@
+= Wets-s Reference
+:toc:
+:toclevels: 2
+
+:icon: font
+include::overview.adoc[]
+
+include::nats.adoc[]
+
+include::wets-s.adoc[]
+
+include::wdriver.adoc[]
+
+[index]
+
+== Index
